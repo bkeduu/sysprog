@@ -165,7 +165,7 @@ static void
 coro_bus_channel_free(struct coro_bus *bus, struct coro_bus_channel *chan);
 
 static int
-coro_bus_realloc_chans(struct coro_bus *bus);
+coro_bus_realloc_channels(struct coro_bus *bus);
 
 static int
 coro_bus_realloc_fds(struct coro_bus *bus);
@@ -221,7 +221,7 @@ coro_bus_channel_open(struct coro_bus *bus, size_t size_limit)
 	assert(bus != NULL);
 	assert(size_limit != 0);
 
-	coro_bus_realloc_chans(bus);
+	coro_bus_realloc_channels(bus);
 
 	struct coro_bus_channel *chan = calloc(1, sizeof(struct coro_bus_channel));
 	chan->data.data = malloc(sizeof(unsigned) * size_limit);
@@ -303,7 +303,7 @@ coro_bus_channel_close(struct coro_bus *bus, int channel)
 	coro_bus_channel_free(bus, chan);
 
 	--bus->channel_count;
-	coro_bus_realloc_chans(bus);
+	coro_bus_realloc_channels(bus);
 }
 
 static void
@@ -450,7 +450,7 @@ coro_bus_try_recv(struct coro_bus *bus, int channel, unsigned *data)
 }
 
 static int
-coro_bus_realloc_chans(struct coro_bus *bus)
+coro_bus_realloc_channels(struct coro_bus *bus)
 {
 	assert(bus != NULL);
 
@@ -510,20 +510,19 @@ coro_bus_realloc_fds(struct coro_bus *bus)
 
 #if NEED_BROADCAST
 
-static int
-coro_bus_has_send_blocking(struct coro_bus *bus)
+static struct coro_bus_channel *
+coro_bus_send_blocking_channel(struct coro_bus *bus)
 {
 	assert(bus != NULL);
 
 	for (size_t i = 0; i < bus->channel_count; ++i) {
 		struct coro_bus_channel *chan = bus->channels[i];
 		if (chan->data.size == chan->size_limit) {
-			wakeup_queue_suspend_this(&chan->send_queue);
-			return 1;
+			return chan;
 		}
 	}
 
-	return 0;
+	return NULL;
 }
 
 static void
@@ -548,7 +547,11 @@ coro_bus_broadcast(struct coro_bus *bus, unsigned data)
 		return -1;
 	}
 
-	while (coro_bus_has_send_blocking(bus)) { }
+	struct coro_bus_channel *blocking_chan = coro_bus_send_blocking_channel(bus);
+	while (blocking_chan != NULL) {
+		wakeup_queue_suspend_this(&blocking_chan->send_queue);
+		blocking_chan = coro_bus_send_blocking_channel(bus);
+	}
 
 	coro_bus_broadcast_internal(bus, data);
 	coro_bus_errno_set(CORO_BUS_ERR_NONE);
@@ -565,7 +568,7 @@ coro_bus_try_broadcast(struct coro_bus *bus, unsigned data)
 		return -1;
 	}
 
-	if (coro_bus_has_send_blocking(bus)) {
+	if (coro_bus_send_blocking_channel(bus) != NULL) {
 		coro_bus_errno_set(CORO_BUS_ERR_WOULD_BLOCK);
 		return -1;
 	}
