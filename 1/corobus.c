@@ -116,8 +116,6 @@ wakeup_queue_wakeup_delete_first(struct wakeup_queue *queue)
 #endif
 
 struct coro_bus_channel {
-	/** Channel descriptor. */
-	int desc;
 	/** Flag, that indicates that one of coros started closing the channel. */
 	int about_to_close;
 	/** Channel max capacity. */
@@ -134,14 +132,6 @@ struct coro_bus {
 	struct coro_bus_channel **channels;
 	size_t channel_count;
 	size_t channel_capacity;
-
-	/**
-	 * This array contains closed channel descriptors.
-	 * Works like stack, pushing to the end, popping from the end.
-	 */
-	int *freed_descriptors;
-	size_t desc_count;
-	size_t desc_capacity;
 };
 
 static enum coro_bus_error_code global_error = CORO_BUS_ERR_NONE;
@@ -158,9 +148,6 @@ coro_bus_errno_set(enum coro_bus_error_code err)
 	global_error = err;
 }
 
-static struct coro_bus_channel *
-coro_bus_find_channel(struct coro_bus *bus, int descriptor);
-
 static void
 coro_bus_channel_free(struct coro_bus *bus, struct coro_bus_channel *chan);
 
@@ -168,7 +155,25 @@ static int
 coro_bus_realloc_channels(struct coro_bus *bus);
 
 static int
-coro_bus_realloc_fds(struct coro_bus *bus);
+coro_bus_is_channel_send_blocking(struct coro_bus_channel *chan)
+{
+	assert(chan != NULL);
+	return chan->size_limit == chan->data.size;
+}
+
+static int
+coro_bus_is_channel_recv_blocking(struct coro_bus_channel *chan)
+{
+	assert(chan != NULL);
+	return 0 == chan->data.size;
+}
+
+static struct coro_bus_channel *
+coro_bus_find_channel(struct coro_bus *bus, int channel)
+{
+	assert(bus != NULL);
+	return bus->channels[channel];
+}
 
 struct coro_bus *
 coro_bus_new(void)
@@ -186,16 +191,7 @@ coro_bus_new(void)
 		return NULL;
 	}
 
-	bus->freed_descriptors = malloc(sizeof(int) * INIT_CAPACITY);
-	if (bus->freed_descriptors == NULL) {
-		free(bus->channels);
-		free(bus);
-		coro_bus_errno_set(CORO_BUS_ERR_UNKNOWN);
-		return NULL;
-	}
-
 	bus->channel_capacity = INIT_CAPACITY;
-	bus->desc_capacity = INIT_CAPACITY;
 
 	coro_bus_errno_set(CORO_BUS_ERR_NONE);
 	return bus;
@@ -207,11 +203,12 @@ coro_bus_delete(struct coro_bus *bus)
 	assert(bus != NULL);
 
 	for (size_t i = 0; i < bus->channel_count; ++i) {
-		coro_bus_channel_free(bus, bus->channels[i]);
+		if (bus->channels[i] != NULL) {
+			coro_bus_channel_free(bus, bus->channels[i]);
+		}
 	}
 
 	free(bus->channels);
-	free(bus->freed_descriptors);
 	free(bus);
 }
 
@@ -224,6 +221,11 @@ coro_bus_channel_open(struct coro_bus *bus, size_t size_limit)
 	coro_bus_realloc_channels(bus);
 
 	struct coro_bus_channel *chan = calloc(1, sizeof(struct coro_bus_channel));
+	if (chan == NULL) {
+		coro_bus_errno_set(CORO_BUS_ERR_UNKNOWN);
+		return -1;
+	}
+
 	chan->data.data = malloc(sizeof(unsigned) * size_limit);
 	if (chan->data.data == NULL) {
 		free(chan);
@@ -231,47 +233,23 @@ coro_bus_channel_open(struct coro_bus *bus, size_t size_limit)
 		return -1;
 	}
 
+	chan->data.capacity = size_limit;
 	chan->size_limit = size_limit;
 
-	int descriptor;
-	if (bus->desc_count != 0) {
-		descriptor = bus->freed_descriptors[--bus->desc_count];
-		coro_bus_realloc_fds(bus);
-	}
-	else {
-		if (bus->channel_count > 0) {
-			descriptor = bus->channels[bus->channel_count - 1]->desc + 1;
-		}
-		else {
-			descriptor = 0;
-		}
-	}
-
-	chan->desc = descriptor;
+	size_t desc = 0;
+	for (; desc < bus->channel_count && bus->channels[desc] != NULL; ++desc) { }
 
 	rlist_create(&chan->recv_queue.coros);
 	rlist_create(&chan->send_queue.coros);
 
-	bus->channels[bus->channel_count++] = chan;
+	bus->channels[desc] = chan;
 
-	coro_bus_errno_set(CORO_BUS_ERR_NONE);
-	return descriptor;
-}
-
-static struct coro_bus_channel *
-coro_bus_find_channel(struct coro_bus *bus, int descriptor)
-{
-	assert(bus != NULL);
-	assert(descriptor >= 0);
-
-	for (size_t i = 0; i < bus->channel_count; ++i) {
-		struct coro_bus_channel *chan = bus->channels[i];
-		if (chan->desc == descriptor) {
-			return chan;
-		}
+	if (desc == bus->channel_count) {
+		++bus->channel_count;
 	}
 
-	return NULL;
+	coro_bus_errno_set(CORO_BUS_ERR_NONE);
+	return desc;
 }
 
 void
@@ -280,29 +258,14 @@ coro_bus_channel_close(struct coro_bus *bus, int channel)
 	assert(bus != NULL);
 	assert(channel >= 0);
 
-	size_t i = 0;
-	struct coro_bus_channel *chan = NULL;
-
-	for (; i < bus->channel_count; ++i) {
-		chan = bus->channels[i];
-		if (chan->desc == channel) {
-			break;
-		}
-	}
-
-	if (chan == NULL || chan->desc != channel) {
+	struct coro_bus_channel *chan = coro_bus_find_channel(bus, channel);
+	if (chan == NULL) {
 		return;
 	}
 
-	memmove(
-		bus->channels + i,
-		bus->channels + i + 1,
-		sizeof(struct coro_bus_chan *) * (bus->channel_count - i - 1)
-	);
-
 	coro_bus_channel_free(bus, chan);
+	bus->channels[channel] = NULL;
 
-	--bus->channel_count;
 	coro_bus_realloc_channels(bus);
 }
 
@@ -311,10 +274,6 @@ coro_bus_channel_free(struct coro_bus *bus, struct coro_bus_channel *chan)
 {
 	assert(bus != NULL);
 	assert(chan != NULL);
-
-	if (coro_bus_realloc_fds(bus) == 0) {
-		bus->freed_descriptors[bus->desc_count++] = chan->desc;
-	}
 
 	chan->about_to_close = 1;
 
@@ -346,13 +305,13 @@ coro_bus_send(struct coro_bus *bus, int channel, unsigned data)
 	assert(channel >= 0);
 
 	struct coro_bus_channel *chan = coro_bus_find_channel(bus, channel);
-	if (chan == NULL || chan->desc != channel) {
+	if (chan == NULL) {
 		coro_bus_errno_set(CORO_BUS_ERR_NO_CHANNEL);
 		return -1;
 	}
 
 	while (chan->about_to_close == 0) {
-		if (chan->data.size == chan->size_limit) {
+		if (coro_bus_is_channel_send_blocking(chan)) {
 			wakeup_queue_suspend_this(&chan->send_queue);
 		}
 		else {
@@ -373,12 +332,12 @@ coro_bus_try_send(struct coro_bus *bus, int channel, unsigned data)
 	assert(channel >= 0);
 
 	struct coro_bus_channel *chan = coro_bus_find_channel(bus, channel);
-	if (chan == NULL || chan->desc != channel || chan->about_to_close != 0) {
+	if (chan == NULL || chan->about_to_close != 0) {
 		coro_bus_errno_set(CORO_BUS_ERR_NO_CHANNEL);
 		return -1;
 	}
 
-	if (chan->data.size == chan->size_limit) {
+	if (coro_bus_is_channel_send_blocking(chan)) {
 		coro_bus_errno_set(CORO_BUS_ERR_WOULD_BLOCK);
        	return -1;
 	}
@@ -406,13 +365,13 @@ coro_bus_recv(struct coro_bus *bus, int channel, unsigned *data)
 	assert(data != NULL);
 
 	struct coro_bus_channel *chan = coro_bus_find_channel(bus, channel);
-	if (chan == NULL || chan->desc != channel) {
+	if (chan == NULL) {
 		coro_bus_errno_set(CORO_BUS_ERR_NO_CHANNEL);
 		return -1;
 	}
 
 	while (chan->about_to_close == 0) {
-		if (chan->data.size == 0) {
+		if (coro_bus_is_channel_recv_blocking(chan)) {
 			wakeup_queue_suspend_this(&chan->recv_queue);
 		}
 		else {
@@ -434,12 +393,12 @@ coro_bus_try_recv(struct coro_bus *bus, int channel, unsigned *data)
 	assert(data != NULL);
 
 	struct coro_bus_channel *chan = coro_bus_find_channel(bus, channel);
-	if (chan == NULL || chan->desc != channel || chan->about_to_close != 0) {
+	if (chan == NULL || chan->about_to_close != 0) {
 		coro_bus_errno_set(CORO_BUS_ERR_NO_CHANNEL);
 		return -1;
 	}
 
-	if (chan->data.size == 0) {
+	if (coro_bus_is_channel_recv_blocking(chan)) {
 		coro_bus_errno_set(CORO_BUS_ERR_WOULD_BLOCK);
 		return -1;
 	}
@@ -453,6 +412,8 @@ static int
 coro_bus_realloc_channels(struct coro_bus *bus)
 {
 	assert(bus != NULL);
+
+	for (; bus->channel_count > 0 && bus->channels[bus->channel_count - 1] == NULL; --bus->channel_count) { }
 
 	size_t new_capacity = bus->channel_capacity;
 	if (bus->channel_count * CAP_MULTIPLIER < bus->channel_capacity && bus->channel_capacity > INIT_CAPACITY) {
@@ -478,46 +439,17 @@ coro_bus_realloc_channels(struct coro_bus *bus)
 	return 0;
 }
 
-static int
-coro_bus_realloc_fds(struct coro_bus *bus)
-{
-	assert(bus != NULL);
-
-	size_t new_capacity = bus->desc_capacity;
-	if (bus->desc_count * CAP_MULTIPLIER < bus->desc_capacity && bus->desc_capacity > INIT_CAPACITY) {
-		new_capacity = bus->desc_capacity / CAP_MULTIPLIER;
-	}
-	else if (bus->desc_count == bus->desc_capacity) {
-		new_capacity = bus->desc_capacity * CAP_MULTIPLIER;
-	}
-
-	if (new_capacity != bus->desc_capacity) {
-		int *new_freed_desc = realloc(
-			bus->freed_descriptors,
-			sizeof(int) * new_capacity
-		);
-		if (new_freed_desc == NULL) {
-			return -1;
-		}
-
-		bus->freed_descriptors = new_freed_desc;
-		bus->desc_capacity = new_capacity;
-	}
-
-	return 0;
-}
-
 
 #if NEED_BROADCAST
 
 static struct coro_bus_channel *
-coro_bus_send_blocking_channel(struct coro_bus *bus)
+coro_bus_get_send_blocking_channel(struct coro_bus *bus)
 {
 	assert(bus != NULL);
 
 	for (size_t i = 0; i < bus->channel_count; ++i) {
 		struct coro_bus_channel *chan = bus->channels[i];
-		if (chan->data.size == chan->size_limit) {
+		if (chan != NULL && coro_bus_is_channel_send_blocking(chan)) {
 			return chan;
 		}
 	}
@@ -532,8 +464,9 @@ coro_bus_broadcast_internal(struct coro_bus *bus, unsigned data)
 
 	for (size_t i = 0; i < bus->channel_count; ++i) {
 		struct coro_bus_channel *chan = bus->channels[i];
-		data_vector_append(&chan->data, data);
-		wakeup_queue_wakeup_first(&chan->recv_queue);
+		if (chan != NULL) {
+			coro_bus_send_internal(chan, data);
+		}
 	}
 }
 
@@ -547,10 +480,10 @@ coro_bus_broadcast(struct coro_bus *bus, unsigned data)
 		return -1;
 	}
 
-	struct coro_bus_channel *blocking_chan = coro_bus_send_blocking_channel(bus);
+	struct coro_bus_channel *blocking_chan = coro_bus_get_send_blocking_channel(bus);
 	while (blocking_chan != NULL) {
 		wakeup_queue_suspend_this(&blocking_chan->send_queue);
-		blocking_chan = coro_bus_send_blocking_channel(bus);
+		blocking_chan = coro_bus_get_send_blocking_channel(bus);
 	}
 
 	coro_bus_broadcast_internal(bus, data);
@@ -568,7 +501,7 @@ coro_bus_try_broadcast(struct coro_bus *bus, unsigned data)
 		return -1;
 	}
 
-	if (coro_bus_send_blocking_channel(bus) != NULL) {
+	if (coro_bus_get_send_blocking_channel(bus) != NULL) {
 		coro_bus_errno_set(CORO_BUS_ERR_WOULD_BLOCK);
 		return -1;
 	}
@@ -612,13 +545,13 @@ coro_bus_send_v(struct coro_bus *bus, int channel, const unsigned *data, unsigne
 	}
 
 	struct coro_bus_channel *chan = coro_bus_find_channel(bus, channel);
-	if (chan == NULL || chan->desc != channel) {
+	if (chan == NULL) {
 		coro_bus_errno_set(CORO_BUS_ERR_NO_CHANNEL);
 		return -1;
 	}
 
 	while (chan->about_to_close == 0) {
-		if (chan->data.size == chan->size_limit) {
+		if (coro_bus_is_channel_send_blocking(chan)) {
 			wakeup_queue_suspend_this(&chan->send_queue);
 		}
 		else {
@@ -645,12 +578,12 @@ coro_bus_try_send_v(struct coro_bus *bus, int channel, const unsigned *data, uns
 	}
 
 	struct coro_bus_channel *chan = coro_bus_find_channel(bus, channel);
-	if (chan == NULL || chan->desc != channel || chan->about_to_close != 0) {
+	if (chan == NULL || chan->about_to_close != 0) {
 		coro_bus_errno_set(CORO_BUS_ERR_NO_CHANNEL);
 		return -1;
 	}
 
-	if (chan->data.size == chan->size_limit) {
+	if (coro_bus_is_channel_send_blocking(chan)) {
 		coro_bus_errno_set(CORO_BUS_ERR_WOULD_BLOCK);
 		return -1;
 	}
@@ -661,7 +594,7 @@ coro_bus_try_send_v(struct coro_bus *bus, int channel, const unsigned *data, uns
 }
 
 static int
-coro_bus_rcv_v_internal(struct coro_bus_channel *chan, unsigned *data, unsigned capacity)
+coro_bus_recv_v_internal(struct coro_bus_channel *chan, unsigned *data, unsigned capacity)
 {
 	assert(chan != NULL);
 	assert(data != NULL);
@@ -687,17 +620,17 @@ coro_bus_recv_v(struct coro_bus *bus, int channel, unsigned *data, unsigned capa
 	}
 
 	struct coro_bus_channel *chan = coro_bus_find_channel(bus, channel);
-	if (chan == NULL || chan->desc != channel) {
+	if (chan == NULL) {
 		coro_bus_errno_set(CORO_BUS_ERR_NO_CHANNEL);
 		return -1;
 	}
 
 	while (chan->about_to_close == 0) {
-		if (chan->data.size == 0) {
+		if (coro_bus_is_channel_recv_blocking(chan)) {
 			wakeup_queue_suspend_this(&chan->recv_queue);
 		}
 		else {
-			int recv_count = coro_bus_rcv_v_internal(chan, data, capacity);
+			int recv_count = coro_bus_recv_v_internal(chan, data, capacity);
 			coro_bus_errno_set(CORO_BUS_ERR_NONE);
 			return recv_count;
 		}
@@ -720,17 +653,17 @@ coro_bus_try_recv_v(struct coro_bus *bus, int channel, unsigned *data, unsigned 
 	}
 
 	struct coro_bus_channel *chan = coro_bus_find_channel(bus, channel);
-	if (chan == NULL || chan->desc != channel || chan->about_to_close != 0) {
+	if (chan == NULL || chan->about_to_close != 0) {
 		coro_bus_errno_set(CORO_BUS_ERR_NO_CHANNEL);
 		return -1;
 	}
 
-	if (chan->data.size == 0) {
+	if (coro_bus_is_channel_recv_blocking(chan)) {
 		coro_bus_errno_set(CORO_BUS_ERR_WOULD_BLOCK);
 		return -1;
 	}
 
-	int recv_count = coro_bus_rcv_v_internal(chan, data, capacity);
+	int recv_count = coro_bus_recv_v_internal(chan, data, capacity);
 	coro_bus_errno_set(CORO_BUS_ERR_NONE);
 	return recv_count;
 }
